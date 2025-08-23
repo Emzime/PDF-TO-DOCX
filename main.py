@@ -1,41 +1,89 @@
 import os
-import shutil
-import tempfile
 import threading
 import tkinter as tk
+import warnings
 from tkinter import filedialog, messagebox, ttk
 
+# noinspection SpellCheckingInspection
 import tkinterdnd2 as tkdnd2
 from PyPDF2 import PdfReader
-from docx import Document
 from pdf2docx import Converter
+from docx import Document
+from docx.shared import Mm
 
-pdf_path = ""
-output_folder = ""
+# --- (Optionnel) filtrages d'avertissements ciblés ---
+# (conservé au cas où d'autres libs émettent des warnings bruyants)
+warnings.filterwarnings("ignore", category=UserWarning, module=r"docxcompose\.properties")
 
-# --- Thème personnalisé ---
-BG_COLOR = "#f7f9fb"
-ACCENT_COLOR = "#4CAF50"
-BUTTON_COLOR = "#2196F3"
+# --- Thème personnalisé (centralisé) ---
+BG_COLOR = "#f7f9fb"  # fond général
+PANEL_BG = "#dee5ec"  # zones encadrées
+TEXT_COLOR = "#333"  # texte principal
+TEXT_COLOR_SECONDARY = "#444"
+TEXT_COLOR_MUTED = "#555"
+
+ACCENT_COLOR = "#4CAF50"  # bouton "Convertir"
+BUTTON_COLOR = "#2196F3"  # bouton "Sélection dossier"
 BUTTON_HOVER_COLOR = "#1976D2"
-FONT = ("Segoe UI", 11)
+
+FONT = ("Segoe UI", 11)  # police standard
+TITLE_FONT = ("Segoe UI", 16, "bold")
+SMALL_FONT = ("Segoe UI", 10)
 
 
-def update_progress(percent):
-    progress_var.set(percent * 100)
-    window.update_idletasks()
+# --- Helper thread-safe pour Tkinter ---
+def _call_with_kwargs(f, a, kw):
+    f(*a, **kw)
 
 
-def update_status(message):
-    label_status.config(text=message)
+def ui_after(func, *args, **kwargs):
+    if kwargs:
+        window.after(0, _call_with_kwargs, func, args, kwargs)
+    else:
+        window.after(0, func, *args)
 
 
-def get_total_pages(path: str) -> int:
-    with open(path, "rb") as f:
-        reader = PdfReader(f)
-        return len(reader.pages)
+# --- Helpers UI ---
+def update_status(message: str):
+    ui_after(label_status.config, text=message)
 
 
+def set_progress_indeterminate(on: bool):
+    if on:
+        progress_bar.config(mode='indeterminate')
+        ui_after(progress_bar.start, 10)  # 10 = vitesse
+    else:
+        try:
+            progress_bar.stop()
+        except FileNotFoundError as e:
+            update_status("❌ Fichier introuvable")
+            ui_after(messagebox.showerror, "Erreur", f"Impossible d'ouvrir le fichier :\n{e}")
+
+        except PermissionError as e:
+            update_status("❌ Permission refusée")
+            ui_after(messagebox.showerror, "Erreur", f"Permission refusée (fichier ou dossier protégé) :\n{e}")
+
+        except OSError as e:
+            update_status("❌ Erreur système")
+            ui_after(messagebox.showerror, "Erreur", f"Erreur système (I/O) :\n{e}")
+
+        except RuntimeError as e:
+            update_status("❌ Erreur interne")
+            ui_after(messagebox.showerror, "Erreur", f"Erreur interne pdf2docx :\n{e}")
+
+        except ValueError as e:
+            update_status("❌ Erreur de données")
+            ui_after(messagebox.showerror, "Erreur", f"Erreur de données/format :\n{e}")
+
+        progress_bar.config(mode='determinate')
+
+
+def style_button(button, color):
+    button.config(bg=color, fg="white", activebackground=BUTTON_HOVER_COLOR,
+                  relief="flat", font=FONT, padx=10, pady=5)
+
+
+# --- Utilitaires ---
 def get_unique_filepath(folder: str, filename: str) -> str:
     base, ext = os.path.splitext(filename)
     counter = 1
@@ -46,56 +94,66 @@ def get_unique_filepath(folder: str, filename: str) -> str:
     return os.path.join(folder, candidate)
 
 
-def merge_docx(files, output_path):
-    merged_document = Document()
-    for file in files:
-        sub_doc = Document(file)
-        for element in sub_doc.element.body:
-            merged_document.element.body.append(element)
-    merged_document.save(output_path)
-
-
+# --- Conversion (UNE PASSE) ---
 def convert_pdf_to_docx(path: str, destination: str):
+    converter = None
     try:
         base_name = os.path.splitext(os.path.basename(path))[0]
         filename = f"{base_name}.docx"
         final_output = get_unique_filepath(destination, filename)
 
-        update_status("🔄 Conversion en cours...")
+        update_status("🔄 Conversion en cours…")
+        ui_after(btn_convert.config, state='disabled')
+        ui_after(btn_select_folder.config, state='disabled')
 
-        btn_convert.config(state='disabled')
-        btn_select_folder.config(state='disabled')
-        progress_var.set(0)
+        # Barre de progression indéterminée
+        progress_bar.pack(pady=10)
+        set_progress_indeterminate(True)
 
-        total_pages = get_total_pages(path)
+        # Lancement conversion
         converter = Converter(path)
-
-        temp_dir = tempfile.mkdtemp()
-        temp_files = []
-
-        for page_number in range(total_pages):
-            temp_file = os.path.join(temp_dir, f"page_{page_number + 1}.docx")
-            converter.convert(temp_file, start=page_number, end=page_number + 1)
-            temp_files.append(temp_file)
-            percent = (page_number + 1) / total_pages
-            update_progress(percent)
-
+        converter.convert(final_output)   # <-- UNE PASSE
         converter.close()
-        merge_docx(temp_files, final_output)
-        shutil.rmtree(temp_dir)
+        converter = None
+
+        # 🔧 Ajuste la taille de page Word au format PDF (évite les bulles/légendes hors page)
+        adjust_docx_section_to_pdf(src_pdf_path=path, docx_path=final_output)
 
         update_status("✅ Conversion terminée")
-        messagebox.showinfo("Succès", f"Conversion terminée :\n{final_output}")
+        ui_after(messagebox.showinfo, "Succès", f"Conversion terminée :\n{final_output}")
 
-    except Exception as e:
-        update_status("❌ Erreur lors de la conversion")
-        messagebox.showerror("Erreur", f"Une erreur est survenue pendant la conversion :\n{str(e)}")
-
+    except FileNotFoundError as e:
+        update_status("❌ Fichier introuvable")
+        ui_after(messagebox.showerror, "Erreur", f"Impossible d'ouvrir le fichier :\n{e}")
+    except PermissionError as e:
+        update_status("❌ Permission refusée")
+        ui_after(messagebox.showerror, "Erreur", f"Permission refusée (fichier ou dossier protégé) :\n{e}")
+    except OSError as e:
+        update_status("❌ Erreur système")
+        ui_after(messagebox.showerror, "Erreur", f"Erreur système (I/O) :\n{e}")
+    except RuntimeError as e:
+        update_status("❌ Erreur interne")
+        ui_after(messagebox.showerror, "Erreur", f"Erreur interne pdf2docx :\n{e}")
+    except ValueError as e:
+        update_status("❌ Erreur de données")
+        ui_after(messagebox.showerror, "Erreur", f"Erreur de données/format :\n{e}")
     finally:
-        btn_convert.config(state='normal')
-        btn_select_folder.config(state='normal')
-        update_convert_button_state()
-        progress_bar.pack_forget()  # Masquer la barre après conversion
+        if converter is not None:
+            try:
+                converter.close()
+            except (OSError, RuntimeError):
+                pass
+        # Rétablir UI
+        set_progress_indeterminate(False)
+        ui_after(progress_bar.pack_forget)
+        ui_after(btn_convert.config, state='normal')
+        ui_after(btn_select_folder.config, state='normal')
+        ui_after(update_convert_button_state)
+
+
+# --- UI logic ---
+pdf_path = ""
+output_folder = ""
 
 
 def update_convert_button_state():
@@ -109,7 +167,6 @@ def start_conversion():
     if not pdf_path or not output_folder:
         messagebox.showwarning("Attention", "Veuillez sélectionner un fichier PDF et un dossier de destination.")
         return
-    progress_bar.pack(pady=10)  # Afficher la barre ici
     threading.Thread(target=convert_pdf_to_docx, args=(pdf_path, output_folder), daemon=True).start()
 
 
@@ -129,8 +186,26 @@ def select_output_folder():
         update_convert_button_state()
 
 
-def style_button(button, color):
-    button.config(bg=color, fg="white", activebackground=BUTTON_HOVER_COLOR, relief="flat", font=FONT, padx=10, pady=5)
+def adjust_docx_section_to_pdf(src_pdf_path: str, docx_path: str):
+    with open(src_pdf_path, "rb") as f:
+        r = PdfReader(f)
+        m = r.pages[0].mediabox
+        width_pt = float(m.width)
+        height_pt = float(m.height)
+
+    width_mm = width_pt * 25.4 / 72.0
+    height_mm = height_pt * 25.4 / 72.0
+
+    doc = Document(docx_path)
+    for section in doc.sections:
+        section.page_width = Mm(width_mm)
+        section.page_height = Mm(height_mm)
+        # marges minimales pour laisser de l’espace aux flottants/callouts
+        section.left_margin = Mm(5)
+        section.right_margin = Mm(5)
+        section.top_margin = Mm(5)
+        section.bottom_margin = Mm(5)
+    doc.save(docx_path)
 
 
 # --- Interface principale ---
@@ -140,12 +215,26 @@ window.geometry("600x500")
 window.configure(bg=BG_COLOR)
 
 # Titre
-label_title = tk.Label(window, text="Convertisseur PDF vers DOCX", font=("Segoe UI", 16, "bold"), bg=BG_COLOR, fg="#333")
+label_title = tk.Label(
+    window,
+    text="Convertisseur PDF vers DOCX",
+    font=TITLE_FONT,
+    bg=BG_COLOR,
+    fg=TEXT_COLOR
+)
 label_title.pack(pady=(20, 10))
 
 # Zone de dépôt
-label_file = tk.Label(window, text="📄 Déposez votre fichier PDF ici", width=60, height=5,
-                      bg="#dee5ec", fg="#333", relief="groove", font=FONT)
+label_file = tk.Label(
+    window,
+    text="📄 Déposez votre fichier PDF ici",
+    width=60,
+    height=5,
+    bg=PANEL_BG,
+    fg=TEXT_COLOR,
+    relief="groove",
+    font=FONT
+)
 label_file.pack(pady=10)
 label_file.drop_target_register(tkdnd2.DND_FILES)
 label_file.dnd_bind('<<Drop>>', on_drop)
@@ -155,8 +244,14 @@ btn_select_folder = tk.Button(window, text="📂 Sélectionner le dossier de sor
 btn_select_folder.pack(pady=(10, 5))
 style_button(btn_select_folder, BUTTON_COLOR)
 
-label_folder = tk.Label(window, text="Aucun dossier sélectionné", wraplength=500,
-                        bg=BG_COLOR, font=("Segoe UI", 10), fg="#444")
+label_folder = tk.Label(
+    window,
+    text="Aucun dossier sélectionné",
+    wraplength=500,
+    bg=BG_COLOR,
+    font=SMALL_FONT,
+    fg=TEXT_COLOR_SECONDARY
+)
 label_folder.pack(pady=(0, 10))
 
 # Bouton Convertir
@@ -164,13 +259,19 @@ btn_convert = tk.Button(window, text="🚀 Convertir", command=start_conversion,
 btn_convert.pack(pady=20)
 style_button(btn_convert, ACCENT_COLOR)
 
-# Barre de progression (initialement masquée)
+# Barre de progression (indéterminée pendant la conv.)
 progress_var = tk.DoubleVar()
-progress_bar = ttk.Progressbar(window, variable=progress_var, maximum=100, length=400)
+progress_bar = ttk.Progressbar(window, variable=progress_var, maximum=100, length=300)
 progress_bar.pack_forget()
 
 # Statut
-label_status = tk.Label(window, text="", fg="#555", font=("Segoe UI", 10), bg=BG_COLOR)
+label_status = tk.Label(
+    window,
+    text="",
+    fg=TEXT_COLOR_MUTED,
+    font=SMALL_FONT,
+    bg=BG_COLOR
+)
 label_status.pack(pady=5)
 
 # Lancement
